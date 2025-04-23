@@ -1,9 +1,10 @@
-// arbitrageBot.ts
 import {
   Connection,
   PublicKey,
   Transaction,
   Commitment,
+  TransactionInstruction,
+  Keypair,
 } from "@solana/web3.js";
 import {
   Raydium,
@@ -11,216 +12,280 @@ import {
   ApiV3PoolInfoItem,
 } from "@raydium-io/raydium-sdk-v2";
 import Decimal from "decimal.js";
+import {
+  createAssociatedTokenAccountInstruction,
+  getAssociatedTokenAddress,
+} from "@solana/spl-token";
+import { BN } from "bn.js";
 
-// ── CONFIG ────────────────────────────────────────────────────────────────
-const API_KEY =
-  "292iv8Ue3o1gCYjwJqyDFm3bntTaYUzYqh6jYu1zwRA53z2RkP7yrjQ24CuauusWfJxiAebPSayH2RT3oG3HeDV5yDs8n3eSSwD";
-const HTTP_URL = `https://solana-mainnet.api.syndica.io/api-key/${API_KEY}`;
-const WS_URL = `wss://solana-mainnet.api.syndica.io/api-key/${API_KEY}`;
-const COMMITMENT = (process.env.COMMITMENT as Commitment) || "confirmed";
+const RPC_URL = process.env.RPC_URL || "https://solana-mainnet.api.syndica.io";
+const WS_URL = process.env.WS_URL || "wss://solana-mainnet.api.syndica.io";
 const OWNER_PUBKEY = new PublicKey(
-  "HQmsmTXzUymb5o383iTNccakfF4f2AzwUy4uzBuUfCbG"
+  process.env.OWNER_PUBKEY || "HQmsmTXzUymb5o383iTNccakfF4f2AzwUy4uzBuUfCbG"
 );
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const SLIPPAGE_PCT = new Decimal(process.env.SLIPPAGE_PCT || "0.5");
+const SLIPPAGE = new Decimal(process.env.SLIPPAGE_PCT || "0.005");
 const POLL_MS = parseInt(process.env.POLL_INTERVAL_MS || "5000", 10);
-// ────────────────────────────────────────────────────────────────────────────
+const MIN_TVL = new Decimal(process.env.MIN_TVL_USD || "5000");
+const MIN_TOKEN_RESERVE = new Decimal(process.env.MIN_TOKEN_RESERVE || "2000");
+const MIN_USDC_RESERVE = new Decimal(process.env.MIN_USDC_RESERVE || "5000");
 
-/** AMM formula: how many out you get for `amountIn` */
+function normalize(raw: number, decimals: number): Decimal {
+  return new Decimal(raw).div(Decimal.pow(10, decimals));
+}
+
+function parseReserves(pool: ApiV3PoolInfoItem) {
+  const aAmt = new Decimal(pool.mintAmountA);
+  const bAmt = new Decimal(pool.mintAmountB);
+  const fee = new Decimal(pool.feeRate);
+
+  if (pool.mintA.address === USDC_MINT) {
+    return {
+      quote: aAmt,
+      base: bAmt,
+      feeRate: fee,
+    };
+  } else if (pool.mintB.address === USDC_MINT) {
+    return {
+      quote: aAmt,
+      base: bAmt,
+      feeRate: fee,
+    };
+  }
+  throw new Error("Pool does not involve USDC");
+}
+
+function midPrice(pool: ApiV3PoolInfoItem): Decimal {
+  const { base, quote } = parseReserves(pool);
+  return quote.div(base);
+}
+
 function getAmountOut(
   amountIn: Decimal,
   reserveIn: Decimal,
   reserveOut: Decimal,
   feeRate: Decimal
 ): Decimal {
-  console.log("amountIn :", amountIn);
-  console.log("reserveIn :", reserveIn);
-  console.log("reserveOut :", reserveOut);
-  console.log("feeRate :", feeRate);
+  console.log("amountIn : ", amountIn);
+  console.log("reserveIn : ", reserveIn);
+  console.log("reserveOut : ", reserveOut);
+  console.log("feeRate : ", feeRate);
 
-  const afterFee = amountIn.mul(Decimal.sub(1, feeRate));
-  console.log("afterFee :", afterFee);
+  const amountAfterFee = amountIn.mul(Decimal.sub(1, feeRate));
+  console.log("amountAfterFee : ", amountAfterFee);
 
-  return afterFee.mul(reserveOut).div(reserveIn.add(afterFee));
+  return amountAfterFee;
 }
 
-/**
- * Take the raw pool data, normalize both vault balances by each token’s decimals,
- * and return { base, quote, feeRate } where:
- *   • base  = [your target token] reserve (human),
- *   • quote = [USDC] reserve (human).
- */
-function parseReserves(pool: ApiV3PoolInfoItem) {
-  const rawA = new Decimal(pool.mintAmountA);
-  const rawB = new Decimal(pool.mintAmountB);
-
-  if (pool.mintA.address === USDC_MINT) {
-    // A = USDC, B = token
-    return {
-      quote: rawA, // USDC reserve (UI)
-      base: rawB, // token reserve (UI)
-      feeRate: new Decimal(pool.feeRate),
-    };
-  } else if (pool.mintB.address === USDC_MINT) {
-    return {
-      quote: rawA,
-      base: rawB,
-      feeRate: new Decimal(pool.feeRate),
-    };
-  } else {
-    throw new Error("Pool not involving USDC");
-  }
-}
-
-/** mid‑price = USDC per token */
-function midPrice(pool: ApiV3PoolInfoItem): Decimal {
-  const { base, quote } = parseReserves(pool);
-  return quote.div(base);
-}
-
-/** fetch all token⇄USDC pools, return cheapest and priciest by mid‑price */
 async function findPools(
   raydium: Raydium,
   tokenMint: string,
-  minTvlUsd = new Decimal(1_000)
+  tokenMint2: string,
+  minTvlUsd = MIN_TVL
 ): Promise<{ cheap: ApiV3PoolInfoItem; expensive: ApiV3PoolInfoItem }> {
   const resp = await raydium.api.fetchPoolByMints({
     mint1: tokenMint,
-    mint2: USDC_MINT,
+    mint2: tokenMint2,
     type: PoolFetchType.All,
   });
-  const allPools = Array.isArray(resp) ? resp : resp.data;
+  const allPools: ApiV3PoolInfoItem[] = Array.isArray(resp) ? resp : resp.data;
+  console.log("allPools : ", allPools);
 
-  // 2) filter out low‑liquidity pools by TVL (or you could use mintAmountB, too)
-  const goodPools = allPools.filter((p) =>
-    // p.tvl is already in USD
-    new Decimal(p.tvl).gte(minTvlUsd)
-  );
-  console.log("goodPools :", goodPools);
+  const bigPools = allPools.filter((pool) => {
+    if (new Decimal(pool.tvl).lt(minTvlUsd)) return false;
+    if (new Decimal(pool.mintAmountA).lte(2000)) return false;
+    if (new Decimal(pool.mintAmountB).lte(4000)) return false;
 
-  if (goodPools.length < 2) {
+    return true;
+  });
+
+  if (bigPools.length < 2) {
     throw new Error(
-      `Not enough pools above ${minTvlUsd.toFixed()} USD TVL for arbitrage`
+      `Not enough large pools: found ${bigPools.length}, need ≥2 ` +
+        `(TVL≥${minTvlUsd.toFixed()}, tokenReserve≥${MIN_TOKEN_RESERVE}, USDCReserve≥${MIN_USDC_RESERVE})`
     );
   }
 
-  // 3) helper to get mid‑price = USDC reserve / token reserve
-  function midPrice(pool: ApiV3PoolInfoItem) {
-    // pool.mintAmountA/B are already human‑normalized
-    const [usdcAmt, tokenAmt] =
-      pool.mintA.address === USDC_MINT
-        ? [new Decimal(pool.mintAmountA), new Decimal(pool.mintAmountB)]
-        : [new Decimal(pool.mintAmountB), new Decimal(pool.mintAmountA)];
-    return usdcAmt.div(tokenAmt);
-  }
-
-  // 4) sort filtered pools by price
-  const sorted = goodPools.sort((a, b) => midPrice(a).comparedTo(midPrice(b)));
+  bigPools.sort((a, b) => midPrice(a).comparedTo(midPrice(b)));
 
   return {
-    cheap: sorted[0],
-    expensive: sorted[sorted.length - 1],
+    cheap: bigPools[0],
+    expensive: bigPools[bigPools.length - 1],
   };
 }
 
-/**
- * Simulate USDC→token on the cheap pool, then token→USDC on the expensive one.
- * If profitable, execute both swaps in one atomic TX.
- */
-async function simulateAndTrade(
+async function checkArbitrage(
+  raydium: Raydium,
   tokenMint: string,
-  initialUsdc: Decimal,
-  connection: Connection,
-  raydium: Raydium
-) {
-  const { cheap, expensive } = await findPools(raydium, tokenMint);
+  tokenMint2: string,
+  initialUsdc: Decimal
+): Promise<{
+  cheap: ApiV3PoolInfoItem;
+  expensive: ApiV3PoolInfoItem;
+  tokensBought: Decimal;
+  finalUsdc: Decimal;
+  profit: Decimal;
+}> {
+  const { cheap, expensive } = await findPools(raydium, tokenMint, tokenMint2);
 
-  const rA = parseReserves(cheap);
-  const rB = parseReserves(expensive);
-
-  const tokens = getAmountOut(initialUsdc, rA.quote, rA.base, rA.feeRate);
-  const finalUsdc = getAmountOut(tokens, rB.base, rB.quote, rB.feeRate);
-  const profit = finalUsdc.sub(initialUsdc);
+  const rCheap = parseReserves(cheap);
+  const rExp = parseReserves(expensive);
+  console.log("rCheap : ", rCheap);
+  console.log("rExp : ", rExp);
 
   console.log(
-    `Prices → cheap: ${midPrice(cheap).toFixed(6)}, expensive: ${midPrice(
+    `Pools → cheap @${midPrice(cheap).toFixed(6)}, expensive @${midPrice(
       expensive
     ).toFixed(6)}`
   );
-  console.log(
-    `Initial USDC: ${initialUsdc.toFixed(6)}, Final USDC: ${finalUsdc.toFixed(
-      6
-    )}, Profit: ${profit.toFixed(6)}`
+
+  // USDC → token
+  const tokensBought = getAmountOut(
+    initialUsdc,
+    rCheap.quote,
+    rCheap.base,
+    rCheap.feeRate
+  );
+  console.log("tokensBought : ", tokensBought);
+
+  // token → USDC
+  const finalUsdc = getAmountOut(
+    tokensBought,
+    rExp.base,
+    rExp.quote,
+    rExp.feeRate
   );
 
-  if (profit.lte(0)) {
-    console.log("No profitable arb right now.");
-    return;
+  const profit = finalUsdc.sub(initialUsdc);
+  return { cheap, expensive, tokensBought, finalUsdc, profit };
+}
+
+async function executeArbitrage(
+  connection: Connection,
+  raydium: Raydium,
+  owner: Keypair,
+  cheap: ApiV3PoolInfoItem,
+  expensive: ApiV3PoolInfoItem,
+  initialUsdc: Decimal,
+  tokensBought: Decimal
+) {
+  const { poolKeys: cheapKeys } = await raydium.liquidity.getPoolInfoFromRpc({
+    poolId: cheap.id,
+  });
+  const { poolKeys: expKeys } = await raydium.liquidity.getPoolInfoFromRpc({
+    poolId: expensive.id,
+  });
+
+  const usdcMint = new PublicKey(USDC_MINT);
+  const tokenMint =
+    cheap.mintA.address === USDC_MINT
+      ? new PublicKey(cheap.mintB.address)
+      : new PublicKey(cheap.mintA.address);
+
+  const usdcAta = await getAssociatedTokenAddress(usdcMint, owner.publicKey);
+  const tokenAta = await getAssociatedTokenAddress(tokenMint, owner.publicKey);
+
+  const ixSetup: TransactionInstruction[] = [];
+  if (!(await connection.getAccountInfo(usdcAta))) {
+    ixSetup.push(
+      createAssociatedTokenAccountInstruction(
+        owner.publicKey,
+        usdcAta,
+        owner.publicKey,
+        usdcMint
+      )
+    );
   }
-  console.log("Profitable! executing swaps…");
+  if (!(await connection.getAccountInfo(tokenAta))) {
+    ixSetup.push(
+      createAssociatedTokenAccountInstruction(
+        owner.publicKey,
+        tokenAta,
+        owner.publicKey,
+        tokenMint
+      )
+    );
+  }
 
-  // load owner token accounts
-  // await raydium.tokenAccounts.loadOwnerTokenAccounts();
-  // const all = raydium.tokenAccounts.getAllTokenAccounts();
-  // const usdcAcc = all.find(a => a.mint.toBase58() === USDC_MINT);
-  // const tokAcc  = all.find(a => a.mint.toBase58() === tokenMint);
-  // if (!usdcAcc || !tokAcc) throw new Error("Missing USDC or target token account");
-
-  // // build and sign both swaps
+  // 3) build the two swap instructions via Liquidity.swap
   // const { transaction: tx1, signers: s1 } = await raydium.liquidity.swap({
-  //   poolKeys: cheap,
-  //   amountIn: initialUsdc,
-  //   slippage: SLIPPAGE_PCT,
-  //   inputTokenAccount: usdcAcc.pubkey,
-  //   outputTokenAccount: tokAcc.pubkey,
+  //   poolKeys: cheapKeys,
+  //   amountIn: new BN(initialUsdc.toNumber()),
+
+  //   inputTokenAccount: usdcAta,
+  //   outputTokenAccount: tokenAta,
   // });
+
   // const { transaction: tx2, signers: s2 } = await raydium.liquidity.swap({
-  //   poolKeys: expensive,
-  //   amountIn: tokens,
-  //   slippage: SLIPPAGE_PCT,
-  //   inputTokenAccount: tokAcc.pubkey,
-  //   outputTokenAccount: usdcAcc.pubkey,
+  //   poolKeys: expKeys,
+  //   amountIn: new BN(tokensBought.toNumber()),
+
+  //   inputTokenAccount: tokenAta,
+  //   outputTokenAccount: usdcAta,
   // });
 
   // const tx = new Transaction()
+  //   .add(...ixSetup)
   //   .add(...tx1.instructions)
   //   .add(...tx2.instructions);
-  // tx.feePayer = OWNER_PUBKEY;
+
+  // tx.feePayer = owner.publicKey;
   // tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  // tx.partialSign(...s1, ...s2);
+  // tx.partialSign(owner, ...s1, ...s2);
 
   // const sig = await connection.sendRawTransaction(tx.serialize());
-  // console.log("Swap TX:", sig);
-  // await connection.confirmTransaction(sig, COMMITMENT);
-  console.log("Arbitrage complete!");
+  // console.log(" Swap TX:", sig);
+  // await connection.confirmTransaction(sig, "finalized");
+  // console.log(" Arbitrage executed!");
 }
 
 (async () => {
-  const tokenMint = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump";
-  const inputTokens = new Decimal(10);
+  const tokenMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const tokenMint2 = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr";
+  const inputUsdc = new Decimal(10);
 
-  const connection = new Connection(HTTP_URL, {
-    commitment: COMMITMENT,
+  const connection = new Connection(RPC_URL, {
+    commitment: (process.env.COMMITMENT as Commitment) || "confirmed",
     wsEndpoint: WS_URL,
   });
   const raydium = await Raydium.load({ connection, owner: OWNER_PUBKEY });
 
-  // if the user input token ≠ USDC, convert to initial USDC using best pool
-  let initialUsdc = inputTokens;
+  let initialUsdc = inputUsdc;
   if (tokenMint.toString() !== USDC_MINT) {
-    const { cheap } = await findPools(raydium, tokenMint);
+    const { cheap } = await findPools(raydium, tokenMint, tokenMint2);
     const { base, quote, feeRate } = parseReserves(cheap);
-    console.log(base, quote, feeRate);
-
-    initialUsdc = getAmountOut(inputTokens, base, quote, feeRate);
+    initialUsdc = getAmountOut(inputUsdc, base, quote, feeRate);
+    console.log(
+      `Converted ${inputUsdc.toFixed()} token → ${initialUsdc.toFixed()} USDC`
+    );
   }
 
-  console.log("Starting arbitrage loop; initial USDC:", initialUsdc.toFixed(6));
-  setInterval(
-    () =>
-      simulateAndTrade(tokenMint, initialUsdc, connection, raydium).catch(
-        console.error
-      ),
-    POLL_MS
-  );
+  console.log(`Starting arbitrage loop with ${initialUsdc.toFixed()} USDC`);
+  setInterval(async () => {
+    try {
+      const { cheap, expensive, tokensBought, finalUsdc, profit } =
+        await checkArbitrage(raydium, tokenMint, tokenMint2, initialUsdc);
+
+      console.log(
+        `Bought ${tokensBought.toFixed()} token, back to ${finalUsdc.toFixed()} USDC → profit ${profit.toFixed()}`
+      );
+
+      if (profit.gt(0)) {
+        console.log("Profitable! executing on‑chain swaps…");
+        // await executeArbitrage(
+        //   connection,
+        //   raydium,
+        //   OWNER_PUBKEY,
+        //   cheap,
+        //   expensive,
+        //   initialUsdc,
+        //   tokensBought
+        // );
+      } else {
+        console.log("No profitable opportunity right now.");
+      }
+    } catch (err) {
+      console.error("Arb check error:", err);
+    }
+  }, POLL_MS);
 })();
