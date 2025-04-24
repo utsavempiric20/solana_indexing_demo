@@ -5,11 +5,14 @@ import {
   Commitment,
   TransactionInstruction,
   Keypair,
+  TransactionMessage,
+  VersionedTransaction,
 } from "@solana/web3.js";
 import {
   Raydium,
   PoolFetchType,
   ApiV3PoolInfoItem,
+  liquidityStateV4Layout,
 } from "@raydium-io/raydium-sdk-v2";
 import Decimal from "decimal.js";
 import {
@@ -17,8 +20,11 @@ import {
   getAssociatedTokenAddress,
 } from "@solana/spl-token";
 import { BN } from "bn.js";
+import dotenv from "dotenv";
+dotenv.config();
 
-const RPC_URL = process.env.RPC_URL || "https://solana-mainnet.api.syndica.io";
+const RPC_URL =
+  process.env.MAINNET_RPC_URL_1 || "https://solana-mainnet.api.syndica.io";
 const WS_URL = process.env.WS_URL || "wss://solana-mainnet.api.syndica.io";
 const OWNER_PUBKEY = new PublicKey(
   process.env.OWNER_PUBKEY || "HQmsmTXzUymb5o383iTNccakfF4f2AzwUy4uzBuUfCbG"
@@ -160,96 +166,116 @@ async function checkArbitrage(
   return { cheap, expensive, tokensBought, finalUsdc, profit };
 }
 
-async function executeArbitrage(
+export async function executeArbitrage(
   connection: Connection,
-  raydium: Raydium,
   owner: Keypair,
+  raydium: Raydium,
   cheap: ApiV3PoolInfoItem,
   expensive: ApiV3PoolInfoItem,
   initialUsdc: Decimal,
   tokensBought: Decimal
 ) {
-  const { poolKeys: cheapKeys } = await raydium.liquidity.getPoolInfoFromRpc({
-    poolId: cheap.id,
-  });
-  const { poolKeys: expKeys } = await raydium.liquidity.getPoolInfoFromRpc({
-    poolId: expensive.id,
-  });
-
-  const usdcMint = new PublicKey(USDC_MINT);
-  const tokenMint =
-    cheap.mintA.address === USDC_MINT
-      ? new PublicKey(cheap.mintB.address)
-      : new PublicKey(cheap.mintA.address);
-
-  const usdcAta = await getAssociatedTokenAddress(usdcMint, owner.publicKey);
-  const tokenAta = await getAssociatedTokenAddress(tokenMint, owner.publicKey);
-
-  const ixSetup: TransactionInstruction[] = [];
-  if (!(await connection.getAccountInfo(usdcAta))) {
-    ixSetup.push(
-      createAssociatedTokenAccountInstruction(
-        owner.publicKey,
-        usdcAta,
-        owner.publicKey,
-        usdcMint
-      )
-    );
-  }
-  if (!(await connection.getAccountInfo(tokenAta))) {
-    ixSetup.push(
-      createAssociatedTokenAccountInstruction(
-        owner.publicKey,
-        tokenAta,
-        owner.publicKey,
-        tokenMint
-      )
-    );
-  }
-
-  // 3) build the two swap instructions via Liquidity.swap
-  // const { transaction: tx1, signers: s1 } = await raydium.liquidity.swap({
+  // 1) load full on-chain PoolKeys for each pool
+  // const { poolKeys: cheapKeys } = await raydium.liquidity.getPoolInfoFromRpc({
+  //   poolId: cheap.id,
+  // });
+  // const { poolKeys: expKeys } = await raydium.liquidity.getPoolInfoFromRpc({
+  //   poolId: expensive.id,
+  // });
+  // // 2) derive associated token accounts (and create them if missing)
+  // const ataUSDC = await getAssociatedTokenAddress(
+  //   new PublicKey(USDC_MINT),
+  //   owner.publicKey
+  // );
+  // // determine your target token mint
+  // const tokenMint = new PublicKey(
+  //   cheap.mintA.address === new PublicKey(USDC_MINT).toBase58()
+  //     ? cheap.mintB.address
+  //     : cheap.mintA.address
+  // );
+  // const ataToken = await getAssociatedTokenAddress(tokenMint, owner.publicKey);
+  // const setupIxs = [];
+  // if (!(await connection.getAccountInfo(ataUSDC))) {
+  //   setupIxs.push(
+  //     createAssociatedTokenAccountInstruction(
+  //       owner.publicKey,
+  //       ataUSDC,
+  //       owner.publicKey,
+  //       new PublicKey(USDC_MINT)
+  //     )
+  //   );
+  // }
+  // if (!(await connection.getAccountInfo(ataToken))) {
+  //   setupIxs.push(
+  //     createAssociatedTokenAccountInstruction(
+  //       owner.publicKey,
+  //       ataToken,
+  //       owner.publicKey,
+  //       tokenMint
+  //     )
+  //   );
+  // }
+  // const swap1 = await raydium.clmm.swap({
+  //   connection,
   //   poolKeys: cheapKeys,
-  //   amountIn: new BN(initialUsdc.toNumber()),
-
-  //   inputTokenAccount: usdcAta,
-  //   outputTokenAccount: tokenAta,
+  //   userKeys: {
+  //     owner: owner.publicKey,
+  //     tokenAccounts: [ataUSDC, ataToken],
+  //   },
+  //   amountIn: initialUsdc,
+  //   slippage: SLIPPAGE,
+  //   fixedSide: "in",
   // });
-
-  // const { transaction: tx2, signers: s2 } = await raydium.liquidity.swap({
+  // const swap2 = await Liquidity.makeSwapTransaction({
+  //   connection,
   //   poolKeys: expKeys,
-  //   amountIn: new BN(tokensBought.toNumber()),
-
-  //   inputTokenAccount: tokenAta,
-  //   outputTokenAccount: usdcAta,
+  //   userKeys: {
+  //     owner: owner.publicKey,
+  //     tokenAccounts: [ataToken, ataUSDC],
+  //   },
+  //   amountIn: tokensBought, // Decimal from your simulation
+  //   slippage: SLIPPAGE,
+  //   fixedSide: "in",
   // });
-
-  // const tx = new Transaction()
-  //   .add(...ixSetup)
-  //   .add(...tx1.instructions)
-  //   .add(...tx2.instructions);
-
-  // tx.feePayer = owner.publicKey;
-  // tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  // tx.partialSign(owner, ...s1, ...s2);
-
+  // // 4) combine into a single VersionedTransaction
+  // const latest = await connection.getLatestBlockhash();
+  // const messageV0 = new TransactionMessage({
+  //   payerKey: owner.publicKey,
+  //   recentBlockhash: latest.blockhash,
+  //   instructions: [...setupIxs, ...swap1.instructions, ...swap2.instructions],
+  // }).compileToV0Message();
+  // const tx = new VersionedTransaction(messageV0);
+  // // 5) sign & send
+  // tx.sign([owner, ...swap1.signers, ...swap2.signers]);
   // const sig = await connection.sendRawTransaction(tx.serialize());
-  // console.log(" Swap TX:", sig);
+  // console.log("▶️ Arbitrage Tx:", sig);
   // await connection.confirmTransaction(sig, "finalized");
-  // console.log(" Arbitrage executed!");
+  // console.log("✅ Arbitrage executed!");
 }
 
 (async () => {
   const tokenMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-  const tokenMint2 = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr";
+  const tokenMint2 = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump";
   const inputUsdc = new Decimal(10);
 
   const connection = new Connection(RPC_URL, {
     commitment: (process.env.COMMITMENT as Commitment) || "confirmed",
     wsEndpoint: WS_URL,
   });
-  const raydium = await Raydium.load({ connection, owner: OWNER_PUBKEY });
+  const raydium = await Raydium.load({
+    connection,
+    owner: OWNER_PUBKEY,
+    cluster: "mainnet",
+  });
 
+  const poolId = "D5MzuR2BVKhhLe5S2LiWHeLUv4QVr1mc2MC2PWdHZWtU";
+  const { poolKeys, poolInfo, poolRpcData } =
+    await raydium.liquidity.getPoolInfoFromRpc({ poolId });
+
+  console.log("poolKeys:", poolKeys);
+  console.log("poolInfo", poolInfo);
+  console.log("Base reserve:", poolRpcData.baseReserve.toString());
+  console.log("Quote reserve:", poolRpcData.quoteReserve.toString());
   let initialUsdc = inputUsdc;
   if (tokenMint.toString() !== USDC_MINT) {
     const { cheap } = await findPools(raydium, tokenMint, tokenMint2);
