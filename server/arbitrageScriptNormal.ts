@@ -21,6 +21,7 @@ import {
 } from "@solana/spl-token";
 import { BN } from "bn.js";
 import dotenv from "dotenv";
+import { fetchPoolIdByToken } from "./raydiumSwapSdk2";
 dotenv.config();
 
 const RPC_URL =
@@ -95,7 +96,6 @@ async function findPools(
     type: PoolFetchType.All,
   });
   const allPools: ApiV3PoolInfoItem[] = Array.isArray(resp) ? resp : resp.data;
-  console.log("allPools : ", allPools);
 
   const bigPools = allPools.filter((pool) => {
     if (new Decimal(pool.tvl).lt(minTvlUsd)) return false;
@@ -113,6 +113,7 @@ async function findPools(
   }
 
   bigPools.sort((a, b) => midPrice(a).comparedTo(midPrice(b)));
+  console.log("bigPools :", bigPools);
 
   return {
     cheap: bigPools[0],
@@ -166,97 +167,11 @@ async function checkArbitrage(
   return { cheap, expensive, tokensBought, finalUsdc, profit };
 }
 
-export async function executeArbitrage(
-  connection: Connection,
-  owner: Keypair,
-  raydium: Raydium,
-  cheap: ApiV3PoolInfoItem,
-  expensive: ApiV3PoolInfoItem,
-  initialUsdc: Decimal,
-  tokensBought: Decimal
-) {
-  // 1) load full on-chain PoolKeys for each pool
-  // const { poolKeys: cheapKeys } = await raydium.liquidity.getPoolInfoFromRpc({
-  //   poolId: cheap.id,
-  // });
-  // const { poolKeys: expKeys } = await raydium.liquidity.getPoolInfoFromRpc({
-  //   poolId: expensive.id,
-  // });
-  // // 2) derive associated token accounts (and create them if missing)
-  // const ataUSDC = await getAssociatedTokenAddress(
-  //   new PublicKey(USDC_MINT),
-  //   owner.publicKey
-  // );
-  // // determine your target token mint
-  // const tokenMint = new PublicKey(
-  //   cheap.mintA.address === new PublicKey(USDC_MINT).toBase58()
-  //     ? cheap.mintB.address
-  //     : cheap.mintA.address
-  // );
-  // const ataToken = await getAssociatedTokenAddress(tokenMint, owner.publicKey);
-  // const setupIxs = [];
-  // if (!(await connection.getAccountInfo(ataUSDC))) {
-  //   setupIxs.push(
-  //     createAssociatedTokenAccountInstruction(
-  //       owner.publicKey,
-  //       ataUSDC,
-  //       owner.publicKey,
-  //       new PublicKey(USDC_MINT)
-  //     )
-  //   );
-  // }
-  // if (!(await connection.getAccountInfo(ataToken))) {
-  //   setupIxs.push(
-  //     createAssociatedTokenAccountInstruction(
-  //       owner.publicKey,
-  //       ataToken,
-  //       owner.publicKey,
-  //       tokenMint
-  //     )
-  //   );
-  // }
-  // const swap1 = await raydium.clmm.swap({
-  //   connection,
-  //   poolKeys: cheapKeys,
-  //   userKeys: {
-  //     owner: owner.publicKey,
-  //     tokenAccounts: [ataUSDC, ataToken],
-  //   },
-  //   amountIn: initialUsdc,
-  //   slippage: SLIPPAGE,
-  //   fixedSide: "in",
-  // });
-  // const swap2 = await Liquidity.makeSwapTransaction({
-  //   connection,
-  //   poolKeys: expKeys,
-  //   userKeys: {
-  //     owner: owner.publicKey,
-  //     tokenAccounts: [ataToken, ataUSDC],
-  //   },
-  //   amountIn: tokensBought, // Decimal from your simulation
-  //   slippage: SLIPPAGE,
-  //   fixedSide: "in",
-  // });
-  // // 4) combine into a single VersionedTransaction
-  // const latest = await connection.getLatestBlockhash();
-  // const messageV0 = new TransactionMessage({
-  //   payerKey: owner.publicKey,
-  //   recentBlockhash: latest.blockhash,
-  //   instructions: [...setupIxs, ...swap1.instructions, ...swap2.instructions],
-  // }).compileToV0Message();
-  // const tx = new VersionedTransaction(messageV0);
-  // // 5) sign & send
-  // tx.sign([owner, ...swap1.signers, ...swap2.signers]);
-  // const sig = await connection.sendRawTransaction(tx.serialize());
-  // console.log("▶️ Arbitrage Tx:", sig);
-  // await connection.confirmTransaction(sig, "finalized");
-  // console.log("✅ Arbitrage executed!");
-}
-
 (async () => {
   const tokenMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-  const tokenMint2 = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump";
+  const tokenMint2 = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr";
   const inputUsdc = new Decimal(10);
+  const POOL_ID = await fetchPoolIdByToken(tokenMint2);
 
   const connection = new Connection(RPC_URL, {
     commitment: (process.env.COMMITMENT as Commitment) || "confirmed",
@@ -268,18 +183,13 @@ export async function executeArbitrage(
     cluster: "mainnet",
   });
 
-  const poolId = "D5MzuR2BVKhhLe5S2LiWHeLUv4QVr1mc2MC2PWdHZWtU";
-  const { poolKeys, poolInfo, poolRpcData } =
-    await raydium.liquidity.getPoolInfoFromRpc({ poolId });
+  const { poolInfo } = await raydium.liquidity.getPoolInfoFromRpc({
+    poolId: POOL_ID!,
+  });
 
-  console.log("poolKeys:", poolKeys);
-  console.log("poolInfo", poolInfo);
-  console.log("Base reserve:", poolRpcData.baseReserve.toString());
-  console.log("Quote reserve:", poolRpcData.quoteReserve.toString());
   let initialUsdc = inputUsdc;
   if (tokenMint.toString() !== USDC_MINT) {
-    const { cheap } = await findPools(raydium, tokenMint, tokenMint2);
-    const { base, quote, feeRate } = parseReserves(cheap);
+    const { base, quote, feeRate } = parseReserves(poolInfo);
     initialUsdc = getAmountOut(inputUsdc, base, quote, feeRate);
     console.log(
       `Converted ${inputUsdc.toFixed()} token → ${initialUsdc.toFixed()} USDC`
@@ -289,8 +199,12 @@ export async function executeArbitrage(
   console.log(`Starting arbitrage loop with ${initialUsdc.toFixed()} USDC`);
   setInterval(async () => {
     try {
-      const { cheap, expensive, tokensBought, finalUsdc, profit } =
-        await checkArbitrage(raydium, tokenMint, tokenMint2, initialUsdc);
+      const { tokensBought, finalUsdc, profit } = await checkArbitrage(
+        raydium,
+        tokenMint,
+        tokenMint2,
+        initialUsdc
+      );
 
       console.log(
         `Bought ${tokensBought.toFixed()} token, back to ${finalUsdc.toFixed()} USDC → profit ${profit.toFixed()}`
